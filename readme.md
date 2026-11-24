@@ -79,3 +79,27 @@ agent: [调用get_waether 工具] -> 南昌今天晴，30摄氏度，东南风2�
 
  - 从能跑 到 ‘跑不挂’
  
+
+# 当前进度（2026-11-24）
+
+- 交互：`for await (const line of rl)` 替代递归 `rl.question`。管道输入 / Ctrl+D 读完
+  不会再抛 `ERR_USE_AFTER_CLOSE` 崩掉，Ctrl+C 走 close 正常收尾。
+- 模型：没配 DASHSCOPE_API_KEY 时用 `src/mock-model.ts`。它现在**也会发工具调用**，
+  所以「南昌今天天气怎么样」不填 key 也能看到
+  [调用: get_weather] -> [结果] -> 第二轮回答 的完整 agent loop。
+- 循环：`agentLoop` 返回 `{ text, steps, toolCalls, stopReason }`；修掉「正常说完话
+  也报超过最大限制」的误判；工具自己抛错不打断循环（错误作为 tool-result 回灌）；
+  模型/网络错误抛给上层，由 `src/agent/errors.ts` 翻成人话。
+- 命令：
+  - `pnpm start` 起对话；`pnpm start -- --max-steps=5` 改步数上限（默认 10）
+  - `pnpm run typecheck` 等价 `tsc --noEmit`（之前 tsconfig 缺 node 类型，有 15 个报错）
+  - `pnpm test` 跑 `node --import tsx --test`，覆盖 loop / mock / 错误分类 22 例
+
+# 自己写 provider 时的坑（做 mock 踩到的）
+
+- 规范 v4 里流式 `tool-call` 的 `input` 必须是 **JSON 字符串**；直接传对象会报
+  `toolCall.input.trim is not a function`（SDK 内部先 trim 再 JSON.parse）。
+- 工具调用要按顺序发：`tool-input-start` -> `tool-input-delta` -> `tool-input-end`
+  -> `tool-call`，最后 `finish` 的 finishReason 用 `tool-calls`。
+- `result.response.messages` 里已经包含 assistant 的 tool-call 和对应的 tool 结果，
+  整段 push 回 messages 就行，不要自己拼。
