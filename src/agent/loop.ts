@@ -1,171 +1,126 @@
-import { streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
-import { detect, recordCall, recordResult, resetHistory } from './loop-detection'
+import { streamText, type ModelMessage } from "ai";
+import { detect, resetHistory, recordCall, recordResult } from './loop-detection'
+import { isRetryable, calculateDelay, sleep } from './retry'
 
-/** 默认最大循环步数：一步 = 一次「模型输出 + 工具执行」 */
-export const DEFAULT_MAX_STEPS = 10
+const MAX_STEPS = 15 // 最大循环次数
+const MAX_RETRIES = 3 // 最大重试次数
 
-/** 本轮循环为什么结束 */
-export type AgentStopReason =
-  /** 模型没有再要工具，正常说完话 */
-  | 'no-tool-call'
-  /** 步数用完了，模型还想继续 */
-  | 'max-steps'
-  /** 死循环检测熔断：工具反复空转，提前停住 */
-  | 'circuit-breaker'
-
-export interface AgentLoopOptions {
-  /** 最大步数，默认 DEFAULT_MAX_STEPS */
-  maxSteps?: number
-  /** 过程日志（调用工具、工具返回等），默认 console；测试里传静默 logger */
-  logger?: Pick<Console, 'log'>
-  /** 模型正文输出到哪里，默认 process.stdout.write */
-  write?: (text: string) => void
-}
-
-export interface AgentLoopResult {
-  /** 本轮所有步骤产生的正文（流式已经输出过一遍，这里给调用方做断言/记录） */
-  text: string
-  /** 实际走了几步 */
-  steps: number
-  /** 实际发起了多少次工具调用 */
-  toolCalls: number
-  stopReason: AgentStopReason
+export interface BudgetState {
+  used: number
+  limit: number
 }
 
 export async function agentLoop(
-  model: LanguageModel,
-  tools: ToolSet,
+  model: any,
+  tools: any,
   messages: ModelMessage[],
   system: string,
-  options: AgentLoopOptions = {},
-): Promise<AgentLoopResult> {
-  const maxSteps = Math.max(1, Math.trunc(options.maxSteps ?? DEFAULT_MAX_STEPS))
-  const log = options.logger ?? console
-  const write = options.write ?? ((text: string) => process.stdout.write(text))
-
-  // 每轮对话从空历史开始，上一轮的调用记录不该影响这一轮
-  resetHistory()
-
+  budget: BudgetState
+) {
   let step = 0
-  let toolCalls = 0
-  let text = ''
-  let stopReason: AgentStopReason = 'max-steps'
-  /** 本轮要回灌给模型的警告；等工具结果进上下文后再注入 */
-  let pendingWarning: string | undefined
-  /** 熔断原因；等本轮流式跑完、消息回灌后再停，免得留下半截工具调用 */
-  let breakerMessage: string | undefined
-  /** toolCallId -> 调用参数，给 tool-result 补记结果用 */
-  const callsById = new Map<string, { name: string; input: unknown }>()
 
-  while (step < maxSteps) {
+  resetHistory()  // 重置工具执行的历史记录
+
+  while (step < MAX_STEPS) {
     step++
-    log.log(`\n--- Step ${step} ---`)
+    console.log(`\n--- Step ${step} ---`);
 
-    const result = streamText({
-      model,
-      tools,
-      messages,
-      system,
-      // 不配置 stopWhen，就只会跑一次；多轮由下面的 while 循环自己控制
-      // SDK 默认会把错误对象整个打到 stderr（几百行），这里关掉：
-      // 错误由下面 fullStream 的 error part 统一抛给上层，由 errors.ts 翻成人话
-      onError: () => {},
-    })
+    let hasToolCall = false  // 当前这轮是否有工具调用
+    let fullText = ''  // 当前这轮的模型输出
+    let shouldBreak = false  // 是否需要熔断
+    let lastToolCall: { name: string, input: unknown } | null = null  // 最后一个工具调用记录
+    let stepResponse: Awaited<ReturnType<typeof streamText>['response']>;
 
-    let hasToolCall = false
-    let stepText = ''
+    // 步骤重试：应该包裹 streamText，和 result的处理
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const result = streamText({
+          model,
+          tools,
+          messages,
+          system,
+          maxRetries: 0,  // 不配置重试，就只会跑一次
+          onError: () => { }
+          // 不配置 stopwhen，就只会跑一次
+        })
 
-    for await (const part of result.fullStream) {
-      switch (part.type) {
-        case 'text-delta':
-          write(part.text)
-          stepText += part.text
-          break
-        case 'tool-call': {
-          hasToolCall = true
-          toolCalls++
-          log.log(`\n  [调用: ${part.toolName}(${JSON.stringify(part.input)})]`)
-          callsById.set(part.toolCallId, { name: part.toolName, input: part.input })
-          // 先记这次调用再检测：检测里的计数包含当前这次
-          recordCall(part.toolName, part.input)
-          const verdict = detect(part.toolName, part.input)
-          if (verdict.stuck) {
-            log.log(`  ${verdict.message}`)
-            if (verdict.level === 'critical') breakerMessage = verdict.message
-            else pendingWarning = verdict.message
+        for await (const part of result.fullStream) {  // fullStream 是ai库生成一个水桶，里面装的是模型的输出，并且当工具调用完毕后会自动的将结果添加到水桶中
+          switch (part.type) {
+            case 'text-delta':
+              process.stdout.write(part.text);
+              fullText += part.text;
+              break;
+            case 'tool-call':
+              hasToolCall = true
+              lastToolCall = { name: part.toolName, input: part.input }
+              console.log(`\n  [调用: ${part.toolName}(${JSON.stringify(part.input)})]`);
+              // 检测是否需要熔断或警告
+              const detection = detect(part.toolName, part.input)
+              if (detection.stuck) {  // 至少到了危险警告阶段
+                console.log(` ${detection.message}`);
+                if (detection.level === 'critical') {  // 直接熔断
+                  shouldBreak = true
+                } else {
+                  messages.push({
+                    role: 'user' as const,
+                    content: `[系统提醒] ${detection.message}，请换一个思路解决问题，不要重复同样的操作。`,
+                  })
+                }
+              }
+
+              recordCall(part.toolName, part.input)  // 记录当前这次的工具调用
+              break;
+
+            case 'tool-result':
+              console.log(`  [结果: ${JSON.stringify(part.output)}]`);
+              // 记录工具调用结果指纹
+              if (lastToolCall) {
+                recordResult(lastToolCall.name, lastToolCall.input, part.output)
+              }
+              break;
           }
-          break
         }
-        case 'tool-result': {
-          // 把结果回填到刚才那次调用，「同参同结果」才能算无进展
-          const call = callsById.get(part.toolCallId)
-          if (call) {
-            recordResult(call.name, call.input, part.output)
-            callsById.delete(part.toolCallId)
-          }
-          log.log(`  [结果: ${JSON.stringify(part.output)}]`)
-          break
-        }
-        case 'tool-error':
-          // 工具自己抛错：SDK 把错误当作 tool-result 回灌给模型，
-          // 循环照常继续，让模型自己决定怎么补救；这里只补一条可观测日志
-          log.log(`  [工具异常: ${part.toolName}] ${describe(part.error)}`)
-          break
-        case 'error':
-          // 模型/网络层错误：继续循环只会拿到空回复，直接抛给上层去提示用户
-          throw toError(part.error)
-        case 'finish':
-          if (part.finishReason === 'length') {
-            log.log('\n  [提示: 达到模型输出上限，本轮回复被截断]')
-          }
-          break
+
+        stepResponse = await result.response
+
+        break
+
+      } catch (error) {
+        if (attempt > MAX_RETRIES || !isRetryable(error as Error)) throw error
+        const delay = calculateDelay(attempt)
+        console.log(` [重试] 第 ${attempt}/${MAX_RETRIES} 次失败，${delay}ms 后重试...`);  // 计算重试延迟
+        await sleep(delay)
+        hasToolCall = false
+        fullText = ''
+        shouldBreak = false
+        lastToolCall = null
       }
     }
 
-    text += stepText
-    if (stepText) write('\n')
 
-    // response.messages 里既有 assistant 的工具调用，也有对应的 tool 结果，
-    // 整段回灌给 messages，下一轮模型才看得到工具返回了什么
-    const stepMessages = await result.response
-    messages.push(...stepMessages.messages)
 
-    // 警告放在工具结果之后回灌，模型下一轮才看得到完整上下文
-    if (pendingWarning) {
-      messages.push({ role: 'user', content: `[系统提示] ${pendingWarning}` })
-      pendingWarning = undefined
-    }
-
-    // 熔断等整轮流式跑完再生效，免得留下「有 tool-call 没 tool 结果」的半截消息
-    if (breakerMessage) {
-      stopReason = 'circuit-breaker'
+    // 判断是否需要熔断
+    if (shouldBreak) {
+      console.log('\n [循环检测触发，Agent已停止]')
       break
     }
 
-    // 退出条件：模型这次没有再要工具
+    messages.push(...stepResponse!.messages)
+
+
+
+    // 退出条件
     if (!hasToolCall) {
-      stopReason = 'no-tool-call'
+      if (fullText) console.log()
       break
     }
 
     // 还有工具调用，继续循环
-    if (step < maxSteps) log.log(' --> 模型还在工作，继续下一步...')
+    console.log(' --> 模型还在工作，继续下一步...');
   }
 
-  // 只有「步数用满、模型还想继续」才算 max-steps。
-  // 原实现用 step >= MAX_STEPS 判断，正常在最后一步说完话也会误报「超过最大限制」
-  if (stopReason === 'max-steps') {
-    log.log(`\n已达到最大步数 ${maxSteps}，本轮提前结束（可用 --max-steps 调大上限）。`)
+  if (step >= MAX_STEPS) {
+    console.log('循环次数超过最大限制，退出循环。')
   }
 
-  return { text, steps: step, toolCalls, stopReason }
-}
-
-function toError(value: unknown): Error {
-  if (value instanceof Error) return value
-  return new Error(typeof value === 'string' ? value : JSON.stringify(value))
-}
-
-function describe(value: unknown): string {
-  return value instanceof Error ? value.message : String(value)
 }
