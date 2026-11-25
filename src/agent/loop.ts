@@ -32,7 +32,7 @@ export async function agentLoop(
     let stepResponse: Awaited<ReturnType<typeof streamText>['response']>;
 
     // 步骤重试：应该包裹 streamText，和 result的处理
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 1;; attempt++) {
       try {
         const result = streamText({
           model,
