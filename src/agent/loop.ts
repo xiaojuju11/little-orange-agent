@@ -30,9 +30,10 @@ export async function agentLoop(
     let shouldBreak = false  // 是否需要熔断
     let lastToolCall: { name: string, input: unknown } | null = null  // 最后一个工具调用记录
     let stepResponse: Awaited<ReturnType<typeof streamText>['response']>;
+    let stepUsage: Awaited<ReturnType<typeof streamText>['usage']>
 
     // 步骤重试：应该包裹 streamText，和 result的处理
-    for (let attempt = 1;; attempt++) {
+    for (let attempt = 1; ; attempt++) {
       try {
         const result = streamText({
           model,
@@ -82,6 +83,7 @@ export async function agentLoop(
         }
 
         stepResponse = await result.response
+        stepUsage = await result.usage
 
         break
 
@@ -98,7 +100,6 @@ export async function agentLoop(
     }
 
 
-
     // 判断是否需要熔断
     if (shouldBreak) {
       console.log('\n [循环检测触发，Agent已停止]')
@@ -107,6 +108,18 @@ export async function agentLoop(
 
     messages.push(...stepResponse!.messages)
 
+    // Token 预算追踪：记录当前这轮的token用量 (输入+输出 的token计算已经在 streamText 中做了)
+    const inp = typeof stepUsage?.inputTokens === 'number' ? stepUsage.inputTokens : ((stepUsage?.inputTokens as any)?.total ?? 0)
+    const out = typeof stepUsage?.outputTokens === 'number' ? stepUsage.outputTokens : ((stepUsage?.outputTokens as any)?.total ?? 0)
+    budget.used += inp + out
+    const pct = Math.round((budget.used / budget.limit) * 100)
+    console.log(` [Token 预算] 已使用 ${budget.used} / ${budget.limit}，(${pct}%)`)
+
+    // 检查是否超过预算
+    if (budget.used > budget.limit) {
+      console.log('\n [Token 预算耗尽，强制停止]')
+      break
+    }
 
 
     // 退出条件
